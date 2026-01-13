@@ -12,7 +12,7 @@ from core.logger import SkyLog
 
 class SkyNet:
     def __init__(self, host='localhost', port=6000):
-        self.modelname = "Qwen/Qwen3-0.6B"
+        self.modelname = "HuggingFaceTB/SmolLM-135M"
         self.host = host
         self.port = port
         self.tokenizer = None
@@ -129,6 +129,9 @@ class SkyNet:
             self.logger.error("No workers available")
             return
         
+        self.shards = {}
+        self.logger.info("Cleared existing shards")
+        
         layers = self.get_model_layers()
         num_layers = len(layers)
         hidden_size = self.config.hidden_size
@@ -161,34 +164,47 @@ class SkyNet:
             self.stage_layers.append(stage_layers)
             self.logger.info(f"  Stage {stage_idx}: Workers {stage_workers}, Layers {stage_layers}")
         
-        for stage_idx, (stage_workers, stage_layers) in enumerate(zip(self.pipeline_stages, self.stage_layers)):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import os
+        
+        num_threads = min(os.cpu_count() or 4, num_layers)
+        self.logger.info(f"Using {num_threads} threads for parallel splitting")
+        
+        def split_layer(stage_workers, layer_idx):
+            layer = layers[layer_idx]
             num_stage_workers = len(stage_workers)
             
-            for layer_idx in stage_layers:
-                layer = layers[layer_idx]
+            linear_layers = self.get_linear_layers(layer)
+            layer_shards = {}
+            
+            for local_idx, global_worker_id in enumerate(stage_workers):
+                layer_shards[global_worker_id] = {}
                 
-                linear_layers = self.get_linear_layers(layer)
-                
-                if layer_idx not in self.shards:
-                    self.shards[layer_idx] = {}
-                
-                for local_idx, global_worker_id in enumerate(stage_workers):
-                    if global_worker_id not in self.shards[layer_idx]:
-                        self.shards[layer_idx][global_worker_id] = {}
+                for layer_name, weights in linear_layers.items():
+                    weight = weights['weight']
+                    bias = weights['bias']
                     
-                    for layer_name, weights in linear_layers.items():
-                        weight = weights['weight']
-                        bias = weights['bias']
-                        
-                        weight_shards = torch.chunk(weight, num_stage_workers, dim=0)
-                        
-                        self.shards[layer_idx][global_worker_id][f'{layer_name}_weight'] = weight_shards[local_idx]
-                        
-                        if bias is not None:
-                            bias_shards = torch.chunk(bias, num_stage_workers, dim=0)
-                            self.shards[layer_idx][global_worker_id][f'{layer_name}_bias'] = bias_shards[local_idx]
-                        else:
-                            self.shards[layer_idx][global_worker_id][f'{layer_name}_bias'] = None
+                    weight_shards = torch.chunk(weight, num_stage_workers, dim=0)
+                    layer_shards[global_worker_id][f'{layer_name}_weight'] = weight_shards[local_idx]
+                    
+                    if bias is not None:
+                        bias_shards = torch.chunk(bias, num_stage_workers, dim=0)
+                        layer_shards[global_worker_id][f'{layer_name}_bias'] = bias_shards[local_idx]
+                    else:
+                        layer_shards[global_worker_id][f'{layer_name}_bias'] = None
+            
+            return layer_idx, layer_shards
+        
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            futures = []
+            for stage_workers, stage_layers in zip(self.pipeline_stages, self.stage_layers):
+                for layer_idx in stage_layers:
+                    future = executor.submit(split_layer, stage_workers, layer_idx)
+                    futures.append(future)
+            
+            for future in as_completed(futures):
+                layer_idx, layer_shards = future.result()
+                self.shards[layer_idx] = layer_shards
         
         for worker_id, conn in enumerate(self.workers):
             worker_stage = None

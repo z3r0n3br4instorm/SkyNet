@@ -97,6 +97,8 @@ class Worker:
     
     def load_shards(self, shards):
         print(f">>> Loading {len(shards)} shards...")
+        # Clear existing shards before loading new ones
+        self.shards = {}
         for shard in shards:
             self.shards[shard['layer']] = shard
         print(f">>> Worker {self.worker_id} ready!")

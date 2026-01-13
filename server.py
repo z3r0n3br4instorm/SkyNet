@@ -31,14 +31,22 @@ class SkyServer(SkyNet):
                     self.logger.info(f"✓ Worker {worker_id} registered from {addr}")
                     conn.send(b"OK")
                     
-                    if not self.model_ready:
-                        self.logger.info("First worker joined - splitting model...")
-                        self.skysplit()
-                    elif len(self.workers) != self.current_worker_count:
-                        self.logger.info(f"Rebalancing: {self.current_worker_count} -> {len(self.workers)} workers")
-                        self.skysplit()
+                    worker_count = len(self.workers)
                     
-                    self.current_worker_count = len(self.workers)
+                    if not self.model_ready and worker_count >= 6:
+                        self.logger.info(f"Minimum workers reached ({worker_count}) - splitting model...")
+                        self.skysplit()
+                        self.current_worker_count = worker_count
+                    elif self.model_ready and worker_count != self.current_worker_count:
+                        self.logger.info(f"Rebalancing: {self.current_worker_count} -> {worker_count} workers (inference continues)")
+                        import threading
+                        def rebalance():
+                            self.skysplit()
+                            self.current_worker_count = worker_count
+                            self.logger.info("✓ Rebalancing complete - workers reset")
+                        threading.Thread(target=rebalance, daemon=True).start()
+                    elif not self.model_ready:
+                        self.logger.info(f"Waiting for minimum 6 workers ({worker_count}/6)")
                 
                 elif data.startswith("INFERENCE:"):
                     if not self.model_ready:
