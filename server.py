@@ -1,0 +1,169 @@
+# DEMO SERVER
+import socket
+import sys
+from core.skycore import SkyNet
+
+class SkyServer(SkyNet):
+    def __init__(self, host='0.0.0.0', port=6000):
+        super().__init__(host, port)
+        self.logger.info("Zerone Laboratories\nSkyNet")
+        self.logger.info(f"Initializing SkyServer on {host}:{port}")
+    
+    def start(self):
+        self.logger.info("Loading model...")
+        self.load_model()
+        
+        self.logger.info("Waiting for workers to connect...")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((self.host, self.port))
+        sock.listen(10)
+        self.logger.info(f"✓ Listening on {self.host}:{self.port}")
+        
+        try:
+            while True:
+                conn, addr = sock.accept()
+                data = conn.recv(1024).decode()
+                
+                if data == "REGISTER_WORKER":
+                    self.workers.append(conn)
+                    worker_id = len(self.workers) - 1
+                    self.logger.info(f"✓ Worker {worker_id} registered from {addr}")
+                    conn.send(b"OK")
+                    
+                    if not self.model_ready:
+                        self.logger.info("First worker joined - splitting model...")
+                        self.skysplit()
+                    elif len(self.workers) != self.current_worker_count:
+                        self.logger.info(f"Rebalancing: {self.current_worker_count} -> {len(self.workers)} workers")
+                        self.skysplit()
+                    
+                    self.current_worker_count = len(self.workers)
+                
+                elif data.startswith("INFERENCE:"):
+                    if not self.model_ready:
+                        self.logger.error("Model not ready - no workers available")
+                        conn.send(b"ERROR:NO_WORKERS")
+                        conn.close()
+                        continue
+                    
+                    text = data.split(":", 1)[1]
+                    self.logger.info(f">>> Inference request: '{text[:50]}...'")
+                    
+                    try:
+                        result = self.run_inference(text)
+                        self.send_large_data(conn, result)
+                        self.logger.info("✓ Inference complete")
+                    except Exception as e:
+                        self.logger.error(f"Inference failed: {e}")
+                        conn.send(b"ERROR:INFERENCE_FAILED")
+                    
+                    conn.close()
+                
+                else:
+                    self.logger.warning(f"Unknown command from {addr}: {data[:50]}")
+                    conn.close()
+        
+        except KeyboardInterrupt:
+            self.logger.info("\n>>> Shutting down server...")
+            sock.close()
+            sys.exit(0)
+    
+    def run_inference(self, text, max_tokens=20):
+        import torch
+        
+        self.logger.info(f"Tokenizing input...")
+        inputs = self.tokenizer(text, return_tensors="pt")
+        input_ids = inputs.input_ids
+        
+        layers = self.get_model_layers()
+        
+        if self.model_type == 'causal':
+            if hasattr(self.model, 'transformer'):
+                wte = self.model.transformer.wte
+                wpe = self.model.transformer.wpe
+                ln_f = self.model.transformer.ln_f
+            else:
+                wte = self.model.model.embed_tokens
+                wpe = None
+                ln_f = self.model.model.norm
+            lm_head = self.model.lm_head
+        elif self.model_type == 'encoder':
+            self.logger.error("Encoder-only models don't support text generation")
+            return {'input': text, 'generated': text}
+        
+        for token_idx in range(max_tokens):
+            self.logger.info(f"  Generating token {token_idx + 1}/{max_tokens}...")
+            
+            with torch.no_grad():
+                hidden = wte(input_ids)
+                if wpe is not None:
+                    positions = torch.arange(input_ids.size(1))
+                    hidden = hidden + wpe(positions)
+                
+                for stage_idx, (stage_workers, stage_layers) in enumerate(zip(self.pipeline_stages, self.stage_layers)):
+                    for layer_idx in stage_layers:
+                        layer = layers[layer_idx]
+                        
+                        ln_1_weight = None
+                        ln_1_bias = None
+                        ln_2_weight = None
+                        ln_2_bias = None
+                        
+                        for name, module in layer.named_modules():
+                            if 'ln_1' in name or 'input_layernorm' in name:
+                                if hasattr(module, 'weight'):
+                                    ln_1_weight = module.weight
+                                    ln_1_bias = module.bias if hasattr(module, 'bias') else None
+                            elif 'ln_2' in name or 'post_attention_layernorm' in name:
+                                if hasattr(module, 'weight'):
+                                    ln_2_weight = module.weight
+                                    ln_2_bias = module.bias if hasattr(module, 'bias') else None
+                        
+                        active_workers = []
+                        for worker_id in stage_workers:
+                            conn = self.workers[worker_id]
+                            success = self.send_large_data(conn, {
+                                'cmd': 'COMPUTE',
+                                'layer': layer_idx,
+                                'input': hidden,
+                                'ln_1_weight': ln_1_weight,
+                                'ln_1_bias': ln_1_bias,
+                                'ln_2_weight': ln_2_weight,
+                                'ln_2_bias': ln_2_bias
+                            })
+                            if success:
+                                active_workers.append(worker_id)
+                        
+                        results = []
+                        for worker_id in active_workers:
+                            conn = self.workers[worker_id]
+                            result = self.recv_large_data(conn)
+                            if result is not None:
+                                results.append(result)
+                        
+                        if results:
+                            hidden = hidden + sum(results)
+                        else:
+                            self.logger.warning(f"No active workers for stage {stage_idx}")
+                
+                hidden = ln_f(hidden)
+                logits = lm_head(hidden)
+                
+                next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                input_ids = torch.cat([input_ids, next_token], dim=-1)
+                
+                if self.tokenizer.eos_token_id and next_token.item() == self.tokenizer.eos_token_id:
+                    self.logger.info("EOS token reached")
+                    break
+        
+        generated_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+        
+        return {
+            'input': text,
+            'generated': generated_text
+        }
+
+if __name__ == "__main__":
+    server = SkyServer()
+    server.start()
