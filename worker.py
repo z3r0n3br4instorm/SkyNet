@@ -120,7 +120,8 @@ class Worker:
     
     def compute_layer(self, task):
         layer_idx = task['layer']
-        x = task['input'].detach()
+        x_full = task['input'].detach()
+        x_chunk = task['input_chunk'].detach() if 'input_chunk' in task else x_full
         shard = self.shards[layer_idx]
         
         with torch.no_grad():
@@ -133,6 +134,14 @@ class Worker:
                 weight = op['weight']
                 bias = op['bias']
                 parallel_type = op['parallel_type']
+                
+                # Choose the appropriate input based on parallelism type
+                if parallel_type == 'column':
+                    # Column-parallel: use full input
+                    x = x_full
+                else:
+                    # Row-parallel: use chunked input
+                    x = x_chunk
                 
                 # Compute partial result: x @ weight.T + bias
                 partial = torch.matmul(x, weight.T)

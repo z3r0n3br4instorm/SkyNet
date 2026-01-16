@@ -130,13 +130,21 @@ class SkyServer(SkyNet):
                                     ln_2_bias = module.bias if hasattr(module, 'bias') else None
                         
                         # Send input to all workers in this stage
+                        # For row-parallel operations, need to split input as well
+                        num_workers_in_stage = len(stage_workers)
+                        input_chunks = torch.chunk(hidden, num_workers_in_stage, dim=-1)
+                        
                         active_workers = []
-                        for worker_id in stage_workers:
+                        for local_idx, worker_id in enumerate(stage_workers):
                             conn = self.workers[worker_id]
+                            # Send the appropriate input chunk for this worker
+                            worker_input_chunk = input_chunks[local_idx]
+                            
                             success = self.send_large_data(conn, {
                                 'cmd': 'COMPUTE',
                                 'layer': layer_idx,
-                                'input': hidden,
+                                'input': hidden,  # Full input for column-parallel
+                                'input_chunk': worker_input_chunk,  # Chunked input for row-parallel
                                 'ln_1_weight': ln_1_weight,
                                 'ln_1_bias': ln_1_bias,
                                 'ln_2_weight': ln_2_weight,
