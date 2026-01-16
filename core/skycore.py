@@ -12,7 +12,7 @@ from core.logger import SkyLog
 
 class SkyNet:
     def __init__(self, host='localhost', port=6000):
-        self.modelname = "HuggingFaceTB/SmolLM-135M"
+        self.modelname = "HuggingFaceTB/SmolLM2-135M-Instruct"
         self.host = host
         self.port = port
         self.tokenizer = None
@@ -220,7 +220,14 @@ class SkyNet:
             worker_shards = []
             for layer_idx in assigned_layers:
                 if layer_idx in self.shards and worker_id in self.shards[layer_idx]:
-                    worker_shards.append({'layer': layer_idx, **self.shards[layer_idx][worker_id]})
+                    # Detach tensors before sending to workers
+                    shard_data = {'layer': layer_idx}
+                    for k, v in self.shards[layer_idx][worker_id].items():
+                        if isinstance(v, torch.Tensor):
+                            shard_data[k] = v.detach()
+                        else:
+                            shard_data[k] = v
+                    worker_shards.append(shard_data)
             
             self.send_large_data(conn, {'cmd': 'LOAD_SHARDS', 'shards': worker_shards})
             self.logger.info(f"  [+] Worker {worker_id} loaded {len(worker_shards)} layer shards")

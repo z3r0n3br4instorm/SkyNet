@@ -12,10 +12,8 @@ class InferenceClient:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect((self.server_host, self.server_port))
         
-        # Send inference request
         sock.send(f"INFERENCE:{text}".encode())
         
-        # Receive result with size-prefixed protocol
         size_bytes = b''
         while len(size_bytes) < 8:
             chunk = sock.recv(8 - len(size_bytes))

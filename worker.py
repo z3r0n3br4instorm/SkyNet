@@ -98,14 +98,29 @@ class Worker:
     def load_shards(self, shards):
         print(f">>> Loading {len(shards)} shards...")
         # Clear existing shards before loading new ones
+        import gc
         self.shards = {}
+        gc.collect()
+        
         for shard in shards:
-            self.shards[shard['layer']] = shard
+            # Detach tensors to prevent gradient tracking and reduce memory
+            detached_shard = {'layer': shard['layer']}
+            for key, value in shard.items():
+                if key != 'layer' and value is not None:
+                    if isinstance(value, torch.Tensor):
+                        detached_shard[key] = value.detach().clone()
+                    else:
+                        detached_shard[key] = value
+                elif key != 'layer':
+                    detached_shard[key] = None
+            self.shards[shard['layer']] = detached_shard
+        
+        gc.collect()
         print(f">>> Worker {self.worker_id} ready!")
     
     def compute_layer(self, task):
         layer_idx = task['layer']
-        x = task['input']
+        x = task['input'].detach()  # Detach input to break gradient chain
         shard = self.shards[layer_idx]
         
         batch, seq_len, dim = x.shape
@@ -113,31 +128,32 @@ class Worker:
         weights = {k: v for k, v in shard.items() if k.endswith('_weight')}
         biases = {k: v for k, v in shard.items() if k.endswith('_bias')}
         
-        if task.get('ln_1_weight') is not None:
-            x = F.layer_norm(x, (dim,), task['ln_1_weight'], task['ln_1_bias'])
-        
-        hidden = x
-        for weight_name, weight in weights.items():
-            bias_name = weight_name.replace('_weight', '_bias')
-            bias = biases.get(bias_name)
+        with torch.no_grad():  # Ensure no gradient computation
+            if task.get('ln_1_weight') is not None:
+                x = F.layer_norm(x, (dim,), task['ln_1_weight'], task['ln_1_bias'])
             
-            if weight.dim() == 2:
-                hidden = torch.matmul(hidden, weight.T)
-            else:
-                hidden = torch.matmul(hidden, weight)
+            hidden = x
+            for weight_name, weight in weights.items():
+                bias_name = weight_name.replace('_weight', '_bias')
+                bias = biases.get(bias_name)
+                
+                if weight.dim() == 2:
+                    hidden = torch.matmul(hidden, weight.T)
+                else:
+                    hidden = torch.matmul(hidden, weight)
+                
+                if bias is not None:
+                    hidden = hidden + bias
+                
+                # Apply activation if not last layer
+                # Heuristic: if output grows, it's an expansion layer (apply GELU)
+                if hidden.shape[-1] > dim:
+                    hidden = F.gelu(hidden)
             
-            if bias is not None:
-                hidden = hidden + bias
-            
-            # Apply activation if not last layer
-            # Heuristic: if output grows, it's an expansion layer (apply GELU)
-            if hidden.shape[-1] > dim:
-                hidden = F.gelu(hidden)
+            if task.get('ln_2_weight') is not None:
+                hidden = F.layer_norm(hidden, (dim,), task['ln_2_weight'], task['ln_2_bias'])
         
-        if task.get('ln_2_weight') is not None:
-            hidden = F.layer_norm(hidden, (dim,), task['ln_2_weight'], task['ln_2_bias'])
-        
-        return hidden
+        return hidden.detach()  # Detach result before returning
 
 if __name__ == "__main__":
     import sys

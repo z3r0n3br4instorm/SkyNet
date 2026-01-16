@@ -100,10 +100,11 @@ class SkyServer(SkyNet):
             self.logger.error("Encoder-only models don't support text generation")
             return {'input': text, 'generated': text}
         
-        for token_idx in range(max_tokens):
-            self.logger.info(f"  Generating token {token_idx + 1}/{max_tokens}...")
-            
-            with torch.no_grad():
+        # Disable gradient tracking for inference - saves memory and speeds up computation
+        with torch.inference_mode():
+            for token_idx in range(max_tokens):
+                self.logger.info(f"  Generating token {token_idx + 1}/{max_tokens}...")
+                
                 hidden = wte(input_ids)
                 if wpe is not None:
                     positions = torch.arange(input_ids.size(1))
@@ -164,8 +165,8 @@ class SkyServer(SkyNet):
                 if self.tokenizer.eos_token_id and next_token.item() == self.tokenizer.eos_token_id:
                     self.logger.info("EOS token reached")
                     break
-        
-        generated_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+            
+            generated_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
         
         return {
             'input': text,
