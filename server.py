@@ -152,7 +152,8 @@ class SkyServer(SkyNet):
                                 results.append(result)
                         
                         if results:
-                            hidden = hidden + sum(results)
+                            # Concatenate partial results from workers along the feature dimension
+                            hidden = hidden + torch.cat(results, dim=-1)
                         else:
                             self.logger.warning(f"No active workers for stage {stage_idx}")
                 

@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 class Worker:
-    def __init__(self, server_host='192.168.1.150', server_port=6000, worker_id=0):
+    def __init__(self, server_host='localhost', server_port=6000, worker_id=0):
         self.server_host = server_host
         self.server_port = server_port
         self.worker_id = worker_id
