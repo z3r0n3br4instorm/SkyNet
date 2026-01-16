@@ -120,40 +120,34 @@ class Worker:
     
     def compute_layer(self, task):
         layer_idx = task['layer']
-        x = task['input'].detach()  # Detach input to break gradient chain
+        x = task['input'].detach()
         shard = self.shards[layer_idx]
         
-        batch, seq_len, dim = x.shape
-        
-        weights = {k: v for k, v in shard.items() if k.endswith('_weight')}
-        biases = {k: v for k, v in shard.items() if k.endswith('_bias')}
-        
-        with torch.no_grad():  # Ensure no gradient computation
-            if task.get('ln_1_weight') is not None:
-                x = F.layer_norm(x, (dim,), task['ln_1_weight'], task['ln_1_bias'])
+        with torch.no_grad():
+            # Return ONLY the partial result for THIS worker's weight shard
+            # The server will combine all partial results appropriately
             
-            hidden = x
-            for weight_name, weight in weights.items():
-                bias_name = weight_name.replace('_weight', '_bias')
-                bias = biases.get(bias_name)
+            partial_results = []
+            
+            for op in shard['operations']:
+                weight = op['weight']
+                bias = op['bias']
+                parallel_type = op['parallel_type']
                 
-                if weight.dim() == 2:
-                    hidden = torch.matmul(hidden, weight.T)
-                else:
-                    hidden = torch.matmul(hidden, weight)
+                # Compute partial result: x @ weight.T + bias
+                partial = torch.matmul(x, weight.T)
                 
                 if bias is not None:
-                    hidden = hidden + bias
+                    partial = partial + bias
                 
-                # Apply activation if not last layer
-                # Heuristic: if output grows, it's an expansion layer (apply GELU)
-                if hidden.shape[-1] > dim:
-                    hidden = F.gelu(hidden)
+                partial_results.append({
+                    'output': partial.detach(),
+                    'parallel_type': parallel_type,
+                    'name': op['name']
+                })
             
-            if task.get('ln_2_weight') is not None:
-                hidden = F.layer_norm(hidden, (dim,), task['ln_2_weight'], task['ln_2_bias'])
-        
-        return hidden.detach()  # Detach result before returning
+            # Return all partial results from this worker
+            return partial_results
 
 if __name__ == "__main__":
     import sys

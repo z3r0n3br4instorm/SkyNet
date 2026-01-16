@@ -129,6 +129,7 @@ class SkyServer(SkyNet):
                                     ln_2_weight = module.weight
                                     ln_2_bias = module.bias if hasattr(module, 'bias') else None
                         
+                        # Send input to all workers in this stage
                         active_workers = []
                         for worker_id in stage_workers:
                             conn = self.workers[worker_id]
@@ -144,18 +145,44 @@ class SkyServer(SkyNet):
                             if success:
                                 active_workers.append(worker_id)
                         
-                        results = []
+                        # Collect all partial results from workers
+                        all_worker_results = []
                         for worker_id in active_workers:
                             conn = self.workers[worker_id]
-                            result = self.recv_large_data(conn)
-                            if result is not None:
-                                results.append(result)
+                            worker_partial_results = self.recv_large_data(conn)
+                            if worker_partial_results is not None:
+                                all_worker_results.append(worker_partial_results)
                         
-                        if results:
-                            # Concatenate partial results from workers along the feature dimension
-                            hidden = hidden + torch.cat(results, dim=-1)
-                        else:
+                        if not all_worker_results:
                             self.logger.warning(f"No active workers for stage {stage_idx}")
+                            continue
+                        
+                        # Group results by operation name and combine
+                        # All workers return results for the same operations in the same order
+                        num_operations = len(all_worker_results[0])
+                        
+                        for op_idx in range(num_operations):
+                            # Collect this operation's results from all workers
+                            op_results = [worker_results[op_idx] for worker_results in all_worker_results]
+                            parallel_type = op_results[0]['parallel_type']
+                            
+                            if parallel_type == 'column':
+                                # Column-parallel: concatenate along feature dimension
+                                partial_outputs = [r['output'] for r in op_results]
+                                combined = torch.cat(partial_outputs, dim=-1)
+                            elif parallel_type == 'row':
+                                # Row-parallel: sum (all-reduce)
+                                partial_outputs = [r['output'] for r in op_results]
+                                combined = sum(partial_outputs)
+                            else:
+                                combined = op_results[0]['output']
+                            
+                            # Apply activation if this is an expansion layer (rough heuristic)
+                            if combined.shape[-1] > hidden.shape[-1]:
+                                combined = torch.nn.functional.gelu(combined)
+                            
+                            # Update hidden state  
+                            hidden = combined
                 
                 hidden = ln_f(hidden)
                 logits = lm_head(hidden)

@@ -110,6 +110,7 @@ class SkyNet:
         raise ValueError(f"Cannot extract layers from {self.model_type}")
     
     def get_linear_layers(self, layer):
+        """This method is kept for backward compatibility but not used in pipeline mode"""
         linear_weights = {}
         
         for name, module in layer.named_modules():
@@ -145,25 +146,23 @@ class SkyNet:
             num_pipeline_stages = num_layers
             workers_per_stage = num_workers // num_layers
         
-        self.logger.info(f"Strategy: {num_pipeline_stages} stages, {workers_per_stage} workers/stage")
+        # TENSOR PARALLELISM: Split layers across workers
+        # All workers work on all layers, but each gets a slice of the weights
+        num_pipeline_stages = 1
+        workers_per_stage = num_workers
+        
+        self.logger.info(f"Strategy: Tensor parallelism - 1 stage, {workers_per_stage} workers")
         
         self.pipeline_stages = []
         self.stage_layers = []
-        layers_per_stage = num_layers // num_pipeline_stages
         
-        for stage_idx in range(num_pipeline_stages):
-            start_worker = stage_idx * workers_per_stage
-            end_worker = start_worker + workers_per_stage
-            stage_workers = list(range(start_worker, min(end_worker, num_workers)))
-            
-            start_layer = stage_idx * layers_per_stage
-            end_layer = start_layer + layers_per_stage if stage_idx < num_pipeline_stages - 1 else num_layers
-            stage_layers = list(range(start_layer, end_layer))
-            
-            self.pipeline_stages.append(stage_workers)
-            self.stage_layers.append(stage_layers)
-            self.logger.info(f"  Stage {stage_idx}: Workers {stage_workers}, Layers {stage_layers}")
+        # Single stage with all workers processing all layers
+        self.pipeline_stages.append(list(range(num_workers)))
+        self.stage_layers.append(list(range(num_layers)))
         
+        self.logger.info(f"  Stage 0: Workers {list(range(num_workers))}, Layers {list(range(num_layers))}")
+        
+        # Split weights with parallelism type annotations
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import os
         
@@ -178,20 +177,52 @@ class SkyNet:
             layer_shards = {}
             
             for local_idx, global_worker_id in enumerate(stage_workers):
-                layer_shards[global_worker_id] = {}
+                layer_shards[global_worker_id] = {'operations': []}
                 
                 for layer_name, weights in linear_layers.items():
                     weight = weights['weight']
                     bias = weights['bias']
                     
-                    weight_shards = torch.chunk(weight, num_stage_workers, dim=0)
-                    layer_shards[global_worker_id][f'{layer_name}_weight'] = weight_shards[local_idx]
+                    # Determine parallelism type based on layer name
+                    # Column-parallel: split output features (dim=0), concatenate results
+                    # Row-parallel: split input features (dim=1), sum results
                     
-                    if bias is not None:
-                        bias_shards = torch.chunk(bias, num_stage_workers, dim=0)
-                        layer_shards[global_worker_id][f'{layer_name}_bias'] = bias_shards[local_idx]
-                    else:
-                        layer_shards[global_worker_id][f'{layer_name}_bias'] = None
+                    parallel_type = 'column'  # default
+                    
+                    # Attention output and MLP down projections are row-parallel
+                    if any(name in layer_name.lower() for name in ['o_proj', 'out_proj', 'dense', 'c_proj', 'down_proj']):
+                        # Check if it's the final projection in attention or MLP
+                        if 'attn' in layer_name.lower() or 'attention' in layer_name.lower():
+                            if not any(x in layer_name.lower() for x in ['q_proj', 'k_proj', 'v_proj', 'query', 'key', 'value']):
+                                parallel_type = 'row'
+                        elif 'mlp' in layer_name.lower() or 'fc' in layer_name.lower():
+                            # MLP down projection
+                            parallel_type = 'row'
+                    
+                    if parallel_type == 'column':
+                        # Split along output dimension (dim=0)
+                        weight_shards = torch.chunk(weight, num_stage_workers, dim=0)
+                        weight_shard = weight_shards[local_idx]
+                        
+                        if bias is not None:
+                            bias_shards = torch.chunk(bias, num_stage_workers, dim=0)
+                            bias_shard = bias_shards[local_idx]
+                        else:
+                            bias_shard = None
+                    else:  # row-parallel
+                        # Split along input dimension (dim=1)
+                        weight_shards = torch.chunk(weight, num_stage_workers, dim=1)
+                        weight_shard = weight_shards[local_idx]
+                        
+                        # For row-parallel, only first worker gets bias
+                        bias_shard = bias if local_idx == 0 else None
+                    
+                    layer_shards[global_worker_id]['operations'].append({
+                        'name': layer_name,
+                        'weight': weight_shard,
+                        'bias': bias_shard,
+                        'parallel_type': parallel_type
+                    })
             
             return layer_idx, layer_shards
         
@@ -220,13 +251,10 @@ class SkyNet:
             worker_shards = []
             for layer_idx in assigned_layers:
                 if layer_idx in self.shards and worker_id in self.shards[layer_idx]:
-                    # Detach tensors before sending to workers
-                    shard_data = {'layer': layer_idx}
-                    for k, v in self.shards[layer_idx][worker_id].items():
-                        if isinstance(v, torch.Tensor):
-                            shard_data[k] = v.detach()
-                        else:
-                            shard_data[k] = v
+                    shard_data = {
+                        'layer': layer_idx,
+                        'operations': self.shards[layer_idx][worker_id]['operations']
+                    }
                     worker_shards.append(shard_data)
             
             self.send_large_data(conn, {'cmd': 'LOAD_SHARDS', 'shards': worker_shards})
